@@ -2,13 +2,16 @@ from __future__ import annotations  # defers evaluation of annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum
 import inspect
 import json
 import logging
 import time
-from typing import Any, ClassVar, Dict, List, Optional, Set, Type, Union
+from typing import Any, ClassVar
 
+import numpy as np
 import pandas as pd
 import pydantic
 from pydantic import BaseModel
@@ -27,7 +30,7 @@ logger = logging.getLogger(__name__)
 def _parse_json_field(
     value: Any,
     field_name: str,
-    index: Optional[int] = None,
+    index: int | None = None,
     critical: bool = True,
 ) -> Any:
     """
@@ -59,7 +62,7 @@ def _parse_json_field(
     return value
 
 
-def _get_all_span_attribute_key_constants(cls: Type, prefix: str) -> List[str]:
+def _get_all_span_attribute_key_constants(cls: type, prefix: str) -> list[str]:
     ret = []
     for curr_name in dir(cls):
         if (not curr_name.startswith("__")) and (not curr_name.endswith("__")):
@@ -88,7 +91,7 @@ def get_all_span_attribute_key_constants() -> set[str]:
 
 
 # Reserved fields (case-insensitive) for dataset specification directly maps to OTEL Span attributes
-DATASET_RESERVED_FIELDS: Set[str] = {
+DATASET_RESERVED_FIELDS: set[str] = {
     field.lower() for field in get_all_span_attribute_key_constants()
 }
 
@@ -96,6 +99,118 @@ DATASET_RESERVED_FIELDS: Set[str] = {
 EXPECTED_TELEMETRY_LATENCY_IN_MS = (
     2 * 60 * 1000
 )  # expected latency from the telemetry pipeline before ingested rows show up in event table
+
+# --- Run comparison helpers ---
+
+
+def _normalize_input(value: Any) -> str:
+    """Produce a canonical string key from a record's input value.
+
+    Handles dict/JSON inputs (sorted-key serialisation) and strips leading /
+    trailing whitespace so that cosmetic differences don't break matching.
+    Only re-serialises JSON when the parsed value is a dict or list; scalar
+    JSON literals (``"123"``, ``"true"``, ``"null"``) are left as-is.
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    s = str(value).strip()
+    # If the string looks like a JSON object/array, re-serialise for key order.
+    if s.startswith(("{", "[")):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return s
+
+
+@dataclass
+class ItemDiff:
+    """Per-item score comparison between two runs for a single metric."""
+
+    input: str
+    score_a: float | None
+    score_b: float | None
+    delta: float | None
+    regressed: bool
+
+
+@dataclass
+class MetricDiff:
+    """Aggregate comparison for a single metric across matched items.
+
+    Attributes:
+        higher_is_better: Direction of the metric.  ``True`` means a positive
+            delta is an improvement; ``False`` means a *negative* delta is
+            an improvement.
+    """
+
+    metric_name: str
+    higher_is_better: bool
+    mean_delta: float
+    ci_lower: float
+    ci_upper: float
+    p_value: float
+    n_regressed: int
+    n_items: int
+    items: list[ItemDiff] = dataclass_field(default_factory=list)
+
+
+@dataclass
+class RunDiff:
+    """Result of comparing two runs.
+
+    .. note:: **Experimental** — this class is part of the run-comparison API
+       introduced in #2629. Its shape may change as the leaderboard work
+       (#2619) lands.
+
+    Returned by :meth:`Run.compare` and :func:`compare_runs`.
+
+    Attributes:
+        run_a_name: Name of the baseline run (``self`` in ``run_a.compare(run_b)``).
+        run_b_name: Name of the candidate run.
+        metrics: Per-metric comparison results keyed by metric name.
+    """
+
+    run_a_name: str
+    run_b_name: str
+    metrics: dict[str, MetricDiff] = dataclass_field(default_factory=dict)
+
+    def summary(self) -> pd.DataFrame:
+        """Return a one-row-per-metric summary DataFrame."""
+        rows = []
+        for md in self.metrics.values():
+            rows.append({
+                "metric": md.metric_name,
+                "higher_is_better": md.higher_is_better,
+                "mean_delta": md.mean_delta,
+                "ci_lower": md.ci_lower,
+                "ci_upper": md.ci_upper,
+                "p_value": md.p_value,
+                "n_regressed": md.n_regressed,
+                "n_items": md.n_items,
+            })
+        return pd.DataFrame(rows)
+
+    def items_df(self, metric_name: str) -> pd.DataFrame:
+        """Return per-item details for a given metric as a DataFrame."""
+        md = self.metrics.get(metric_name)
+        if md is None:
+            raise KeyError(
+                f"Metric '{metric_name}' not found. "
+                f"Available: {list(self.metrics.keys())}"
+            )
+        return pd.DataFrame([
+            {
+                "input": it.input,
+                "score_a": it.score_a,
+                "score_b": it.score_b,
+                "delta": it.delta,
+                "regressed": it.regressed,
+            }
+            for it in md.items
+        ])
 
 
 class RunStatus(str, Enum):
@@ -127,8 +242,8 @@ SUPPORTED_ENTRY_TYPES = [e.value for e in SupportedEntryType]
 
 
 def validate_dataset_spec(
-    dataset_spec: Dict[str, str],
-) -> Dict[str, str]:
+    dataset_spec: dict[str, str],
+) -> dict[str, str]:
     """
     Validates and normalizes the dataset column specification to ensure it contains only
     currently supported span attributes and that the keys are in the correct format.
@@ -168,19 +283,19 @@ class RunConfig(BaseModel):
         description="Type of the source (e.g. 'DATAFRAME' for user provided dataframe or 'TABLE' for user table in Snowflake).",
     )
 
-    dataset_spec: Dict[str, str] = Field(
+    dataset_spec: dict[str, str] = Field(
         default=...,
         description="Mandatory column name mapping from reserved dataset fields to column names in user's table.",
     )
 
-    description: Optional[str] = Field(
+    description: str | None = Field(
         default=None, description="A description for the run."
     )
-    label: Optional[str] = Field(
+    label: str | None = Field(
         default=None,
         description="Text label to group the runs. Take a single label for now",
     )
-    llm_judge_name: Optional[str] = Field(
+    llm_judge_name: str | None = Field(
         default=None,
         description="Name of the LLM judge to be used for the run.",
     )
@@ -188,11 +303,11 @@ class RunConfig(BaseModel):
         default=Mode.APP_INVOCATION,
         description="Mode of operation: LOG_INGESTION for creating spans from existing data, APP_INVOCATION for instrumenting spans from a new app execution.",
     )
-    invocation_max_workers: Optional[int] = Field(
+    invocation_max_workers: int | None = Field(
         default=None,
         description="Max threads for parallel app invocation in run.start(). Defaults to min(len(input_df), 4). Set to 1 for sequential execution.",
     )
-    metric_max_workers: Optional[int] = Field(
+    metric_max_workers: int | None = Field(
         default=None,
         description="Max threads for parallel client-side metric computation in run.compute_metrics(). Defaults to len(metrics). Server-side string metrics are parallelized by Snowflake automatically.",
     )
@@ -222,7 +337,7 @@ class Run(BaseModel):
         exclude=True,
     )
 
-    main_method_name: Optional[str] = Field(
+    main_method_name: str | None = Field(
         default=None, description="Main method of the app.", exclude=True
     )
 
@@ -238,7 +353,7 @@ class Run(BaseModel):
         ..., description="Type of the managing object (e.g. 'EXTERNAL AGENT')."
     )
 
-    object_version: Optional[str] = Field(
+    object_version: str | None = Field(
         default=None, description="Version of the managing object."
     )
 
@@ -247,48 +362,48 @@ class Run(BaseModel):
         description="Unique name of the run. This name should be unique within the object.",
     )
 
-    run_status: Optional[str] = Field(
+    run_status: str | None = Field(
         default=None,
         description="The status of the run on the entity level. Currently it can only be ACTIVE or CANCELLED.",
     )
 
-    description: Optional[str] = Field(
+    description: str | None = Field(
         default=None, description="A description for the run."
     )
 
-    invocation_max_workers: Optional[int] = Field(
+    invocation_max_workers: int | None = Field(
         default=None,
         description="Max threads for parallel app invocation in run.start(). Defaults to min(len(input_df), 4).",
         exclude=True,
     )
-    metric_max_workers: Optional[int] = Field(
+    metric_max_workers: int | None = Field(
         default=None,
         description="Max threads for parallel client-side metric computation. Defaults to len(metrics).",
         exclude=True,
     )
 
     class RunMetadata(BaseModel):
-        labels: Optional[List[str]] = Field(
+        labels: list[str] | None = Field(
             default=None,
             description="Text label to group the runs. Take a single label for now",
         )
-        llm_judge_name: Optional[str] = Field(
+        llm_judge_name: str | None = Field(
             default=None,
             description="Name of the LLM judge to be used for the run.",
         )
-        mode: Optional[str] = Field(
+        mode: str | None = Field(
             default=Mode.APP_INVOCATION.value,
             description="Mode of operation: LOG_INGESTION or APP_INVOCATION.",
         )
-        invocations: Optional[Dict[str, Run.InvocationMetadata]] = Field(
+        invocations: dict[str, Run.InvocationMetadata] | None = Field(
             default=None,
             description="Map of invocation metadata with invocation ID as key.",
         )
-        computations: Optional[Dict[str, Run.ComputationMetadata]] = Field(
+        computations: dict[str, Run.ComputationMetadata] | None = Field(
             default=None,
             description="Map of computation metadata with computation ID as key.",
         )
-        metrics: Optional[Dict[str, Run.MetricsMetadata]] = Field(
+        metrics: dict[str, Run.MetricsMetadata] | None = Field(
             default=None,
             description="Map of metrics metadata with metric ID as key.",
         )
@@ -303,7 +418,7 @@ class Run(BaseModel):
             ...,
             description="Name of the source (e.g. name of the table).",
         )
-        column_spec: Dict[str, str] = Field(
+        column_spec: dict[str, str] = Field(
             default=...,
             description="Column name mapping from reserved dataset fields to column names in user's table.",
         )
@@ -328,7 +443,7 @@ class Run(BaseModel):
         status: Run.CompletionStatusStatus = Field(
             ..., description="The status of the completion."
         )
-        record_count: Optional[int] = Field(
+        record_count: int | None = Field(
             default=None, description="The count of records processed."
         )
 
@@ -337,59 +452,59 @@ class Run(BaseModel):
             return status.value
 
     class InvocationMetadata(BaseModel):
-        input_records_count: Optional[int] = Field(
+        input_records_count: int | None = Field(
             default=None,
             description="The number of input records in the dataset.",
         )
-        id: Optional[str] = Field(
+        id: str | None = Field(
             default=None,
             description="The unique identifier for the invocation metadata.",
         )
-        start_time_ms: Optional[int] = Field(
+        start_time_ms: int | None = Field(
             default=None,
             description="The start time of the invocation.",
         )
-        end_time_ms: Optional[int] = Field(
+        end_time_ms: int | None = Field(
             default=None,
             description="The end time of the invocation.",
         )
-        completion_status: Optional[Run.CompletionStatus] = Field(
+        completion_status: Run.CompletionStatus | None = Field(
             default=None,
             description="The status of the invocation.",
         )
 
     class ComputationMetadata(BaseModel):
-        id: Optional[str] = Field(
+        id: str | None = Field(
             default=None,
             description="Unique id, even if name is repeated.",
         )
-        query_id: Optional[str] = Field(
+        query_id: str | None = Field(
             default=None,
             description="Query id associated with metric computation.",
         )
-        start_time_ms: Optional[int] = Field(
+        start_time_ms: int | None = Field(
             default=None,
             description="Start time of the computation in milliseconds.",
         )
-        end_time_ms: Optional[int] = Field(
+        end_time_ms: int | None = Field(
             default=None,
             description="End time of the computation in milliseconds.",
         )
 
     class MetricsMetadata(BaseModel):
-        id: Optional[str] = Field(
+        id: str | None = Field(
             default=None,
             description="Unique id for the metrics metadata.",
         )
-        name: Optional[str] = Field(
+        name: str | None = Field(
             default=None,
             description="Name of the metric.",
         )
-        completion_status: Optional[Run.CompletionStatus] = Field(
+        completion_status: Run.CompletionStatus | None = Field(
             default=None,
             description="Completion status of the metric computation.",
         )
-        computation_id: Optional[str] = Field(
+        computation_id: str | None = Field(
             default=None,
             description="ID of the computation associated with the metric.",
         )
@@ -453,7 +568,7 @@ class Run(BaseModel):
     def _invoke_single_row(
         self,
         row: pd.Series,
-        dataset_spec: Dict[str, str],
+        dataset_spec: dict[str, str],
         input_records_count: int,
     ):
         main_method_args = []
@@ -653,7 +768,7 @@ class Run(BaseModel):
             all_existing_metrics, invocation_completion_status
         )
 
-    def start(self, input_df: Optional[pd.DataFrame] = None):
+    def start(self, input_df: pd.DataFrame | None = None):
         """
         Start the run by invoking the main method of the user's app with the
         input data.
@@ -749,7 +864,7 @@ class Run(BaseModel):
     def _create_virtual_spans(
         self,
         input_df: pd.DataFrame,
-        dataset_spec: Dict[str, str],
+        dataset_spec: dict[str, str],
         input_records_count: int,
     ):
         """
@@ -836,7 +951,7 @@ class Run(BaseModel):
             logger.debug("Created all nested spans")
 
     def _create_nested_spans_from_dataset_spec(
-        self, dataset_spec: Dict[str, str], row
+        self, dataset_spec: dict[str, str], row
     ):
         """Create properly nested spans within OtelRecordingContext"""
         from trulens.experimental.otel_tracing.core.span import (
@@ -905,7 +1020,7 @@ class Run(BaseModel):
             logger.warning("No record_root defined in dataset_spec")
 
     def _set_span_attributes_from_data(
-        self, span, attributes: Dict[str, any], span_type: str
+        self, span, attributes: dict[str, any], span_type: str
     ):
         """Set span attributes using proper SpanAttributes constants"""
         span_attrs_class = self._get_span_attributes_class(span_type)
@@ -1005,7 +1120,7 @@ class Run(BaseModel):
         }
         return attr_name.lower() in array_attribute_names
 
-    def _process_array_attribute(self, value: any) -> List[str]:
+    def _process_array_attribute(self, value: any) -> list[str]:
         """
         Process a value that should be treated as an array attribute.
 
@@ -1047,8 +1162,8 @@ class Run(BaseModel):
         return [str(value)]
 
     def _group_dataset_spec_by_span_type(
-        self, dataset_spec: Dict[str, str], row
-    ) -> Dict[str, Dict[str, any]]:
+        self, dataset_spec: dict[str, str], row
+    ) -> dict[str, dict[str, any]]:
         """Group dataset_spec entries by span type (record_root, retrieval, generation, etc.)"""
         span_data = {}
 
@@ -1135,7 +1250,7 @@ class Run(BaseModel):
 
     def _should_skip_computation(
         self,
-        metric_name: Union[str, "metric_module.Metric"],
+        metric_name: str | metric_module.Metric,
         run: Run,
     ) -> bool:
         if not isinstance(metric_name, str):
@@ -1185,7 +1300,7 @@ class Run(BaseModel):
 
     def compute_metrics(
         self,
-        metrics: List[Union[str, "metric_module.Metric", MetricConfig]],
+        metrics: list[str | metric_module.Metric | MetricConfig],
     ) -> str:
         """
         Compute metrics for the run.
@@ -1295,7 +1410,7 @@ class Run(BaseModel):
 
     def _compute_client_side_metrics_from_configs(
         self,
-        metric_configs: List[Union[MetricConfig, "metric_module.Metric"]],
+        metric_configs: list[MetricConfig | metric_module.Metric],
     ) -> None:
         """Compute client-side custom metrics from Metric or MetricConfig objects."""
         try:
@@ -1383,9 +1498,9 @@ class Run(BaseModel):
 
     def get_records(
         self,
-        record_ids: Optional[List[str]] = None,
-        offset: Optional[int] = None,
-        limit: Optional[int] = None,
+        record_ids: list[str] | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
     ) -> pd.DataFrame:
         """
         A wrapper API around get_records_and_feedback to retrieve and display overview of records from event table of the run.
@@ -1420,9 +1535,9 @@ class Run(BaseModel):
 
     def get_record_details(
         self,
-        record_ids: Optional[List[str]] = None,
-        offset: Optional[int] = None,
-        limit: Optional[int] = None,
+        record_ids: list[str] | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
     ) -> pd.DataFrame:
         """
         A wrapper API around get_records_and_feedback to retrieve records from event table of the run.
@@ -1446,6 +1561,49 @@ class Run(BaseModel):
 
         return record_details_df
 
+    def compare(
+        self,
+        other: Run,
+        tolerance: float = 0.0,
+        metric_directions: dict[str, bool] | None = None,
+    ) -> RunDiff:
+        """Compare this run (baseline) against *other* (candidate) over the same inputs.
+
+        Records are matched by their ``input`` column.  For each shared metric
+        the method computes per-item deltas, flags regressions, and returns an
+        aggregate delta with a 95 % confidence interval and a permutation
+        p-value.
+
+        When *metric_directions* is ``None`` (the default) the method
+        attempts to look up ``higher_is_better`` from the feedback
+        definitions stored by the session.  If a metric's direction cannot
+        be resolved it defaults to ``True`` and a warning is logged once.
+
+        Args:
+            other: The candidate run to compare against.
+            tolerance: Minimum absolute score drop to flag an item as
+                *regressed*.  Defaults to ``0.0`` (any decrease is flagged).
+            metric_directions: Optional override mapping of metric name to
+                ``higher_is_better`` (``True`` = higher scores are better,
+                ``False`` = lower scores are better).  When provided, this
+                takes precedence over the stored feedback definitions.
+
+        Returns:
+            A :class:`RunDiff` containing per-metric, per-item comparison
+            results.
+
+        Raises:
+            ValueError: If the two runs share no inputs or no metric columns.
+        """
+        if metric_directions is None:
+            metric_directions = _lookup_metric_directions(self.tru_session)
+        return compare_runs(
+            self,
+            other,
+            tolerance=tolerance,
+            metric_directions=metric_directions,
+        )
+
     def _is_cancelled(self) -> bool:
         return self.get_status() == RunStatus.CANCELLED
 
@@ -1466,9 +1624,7 @@ class Run(BaseModel):
 
         logger.info(f"Run {self.run_name} cancelled.")
 
-    def update(
-        self, description: Optional[str] = None, label: Optional[str] = None
-    ):
+    def update(self, description: str | None = None, label: str | None = None):
         """
         Only description and label are allowed to be updated at the moment.
         """
@@ -1491,7 +1647,7 @@ class Run(BaseModel):
 
     @classmethod
     def from_metadata_df(
-        cls, metadata_df: pd.DataFrame, extra: Dict[str, Any]
+        cls, metadata_df: pd.DataFrame, extra: dict[str, Any]
     ) -> Run:
         """
         Create a Run instance from a metadata DataFrame returned by the DAO,
@@ -1528,3 +1684,255 @@ class Run(BaseModel):
         metadata.update(extra)
 
         return cls.model_validate(metadata)
+
+
+# --- Module-level comparison API ---
+
+# Columns that are never treated as metric scores.
+_NON_METRIC_COLS = {"record_id", "input", "output", "latency"}
+
+# Sentinel so the "unresolved direction" warning fires at most once per name.
+_DIRECTION_WARNED: set = set()
+
+
+def _lookup_metric_directions(tru_session: Any) -> dict[str, bool]:
+    """Derive ``{metric_name: higher_is_better}`` from stored feedback defs.
+
+    Mirrors the logic in ``dashboard_utils.get_feedback_defs()``.
+    Returns an empty dict (and logs a warning) when feedback defs are
+    unavailable — callers then fall back to per-metric defaults.
+    """
+    try:
+        db = tru_session.connector.db
+        feedback_defs = db.get_feedback_defs()
+    except Exception:
+        logger.debug(
+            "Could not read feedback definitions; metric directions "
+            "will default to higher_is_better=True.",
+            exc_info=True,
+        )
+        return {}
+
+    directions: dict[str, bool] = {}
+    for _, row in feedback_defs.iterrows():
+        fj = row.get("feedback_json")
+        if fj is None:
+            continue
+        if isinstance(fj, str):
+            try:
+                fj = json.loads(fj)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        name = fj.get("supplied_name", "") or (
+            fj.get("implementation") or {}
+        ).get("name", "")
+        if name:
+            directions[name] = fj.get("higher_is_better", True)
+    return directions
+
+
+def _add_positional_rank(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ``_dup_rank`` column: 0-based occurrence index within each normalised input.
+
+    The DataFrame is sorted by ``record_id`` first so that the rank is
+    deterministic regardless of the row order returned by the database.
+    """
+    df = df.copy()
+    df = df.sort_values("record_id").reset_index(drop=True)
+    df["_input_key"] = df["input"].map(_normalize_input)
+    df["_dup_rank"] = df.groupby("_input_key").cumcount()
+    return df
+
+
+def compare_runs(
+    run_a: Run,
+    run_b: Run,
+    tolerance: float = 0.0,
+    metric_directions: dict[str, bool] | None = None,
+) -> RunDiff:
+    """Compare two runs over the same inputs and detect regressions.
+
+    Records from the two runs are matched by their normalised ``input``
+    value.  When the same input appears more than once in a run (retries,
+    synthetic duplicates, etc.) records are paired **positionally** within
+    each duplicate group — the *k*-th occurrence in run A matches the *k*-th
+    occurrence in run B (ordered by ``record_id``).  Unmatched extras are
+    dropped with a warning.
+
+    For every shared metric column the function computes:
+
+    * **per-item delta** — ``score_b − score_a`` (positive means candidate
+      scored higher).
+    * **regression flag** — ``True`` when the score got *worse* beyond
+      *tolerance*.  The direction depends on ``metric_directions``:
+      higher-is-better metrics regress when ``delta < −tolerance``;
+      lower-is-better metrics regress when ``delta > tolerance``.
+    * **aggregate delta** — mean of the per-item deltas with a 95 %
+      bootstrap confidence interval and a two-sided permutation p-value.
+      These are complementary resampling methods that may disagree
+      marginally near the significance boundary (especially with skewed
+      deltas or small *n*); this is expected.
+
+    Args:
+        run_a: Baseline run.
+        run_b: Candidate run.
+        tolerance: Minimum absolute score change to flag an item as
+            *regressed*.  Defaults to ``0.0``.
+        metric_directions: Mapping of metric name to ``higher_is_better``
+            (``True`` = higher is better, ``False`` = lower is better).
+            Metrics not listed default to ``True`` and a warning is logged.
+            For lower-is-better metrics such as criminality or harmfulness,
+            a *positive* delta (candidate scored higher) is a regression.
+
+    Returns:
+        A :class:`RunDiff` with per-metric comparison results.
+
+    Raises:
+        ValueError: If the runs share no inputs or no metric columns.
+
+    Example::
+
+        run_a = Run(app_v1, ...).start()
+        run_b = Run(app_v2, ...).start()
+        diff = compare_runs(run_a, run_b)
+        print(diff.summary())
+    """
+    from trulens.core.utils import stats as stats_utils
+
+    if metric_directions is None:
+        metric_directions = {}
+
+    df_a = run_a.get_records()
+    df_b = run_b.get_records()
+
+    # Identify metric columns present in both DataFrames.
+    metric_cols = sorted(
+        (set(df_a.columns) & set(df_b.columns)) - _NON_METRIC_COLS
+    )
+    if not metric_cols:
+        raise ValueError(
+            "The two runs share no metric columns to compare. "
+            "Ensure both runs have computed at least one common metric."
+        )
+
+    # Positional ranking within duplicate input groups to avoid cartesian
+    # explosion on pd.merge.  Sorted by record_id for determinism.
+    df_a = _add_positional_rank(df_a)
+    df_b = _add_positional_rank(df_b)
+
+    merged = pd.merge(
+        df_a[["_input_key", "_dup_rank", "input"] + metric_cols],
+        df_b[["_input_key", "_dup_rank"] + metric_cols],
+        on=["_input_key", "_dup_rank"],
+        suffixes=("_a", "_b"),
+        how="inner",
+    )
+    if merged.empty:
+        raise ValueError(
+            "No shared inputs between the two runs. "
+            "Run comparison requires both runs to be executed over the "
+            "same input dataset."
+        )
+
+    n_matched = len(merged)
+    n_only_a = len(df_a) - n_matched
+    n_only_b = len(df_b) - n_matched
+    if n_only_a or n_only_b:
+        logger.warning(
+            "Dropped %d record(s) from run_a and %d from run_b that "
+            "had no matching input in the other run.",
+            n_only_a,
+            n_only_b,
+        )
+
+    metrics_result: dict[str, MetricDiff] = {}
+
+    for col in metric_cols:
+        col_a = f"{col}_a"
+        col_b = f"{col}_b"
+
+        # Resolve direction: explicit override > lookup > default (True).
+        if col in metric_directions:
+            hib = metric_directions[col]
+        else:
+            hib = True
+            if col not in _DIRECTION_WARNED:
+                _DIRECTION_WARNED.add(col)
+                logger.warning(
+                    "No metric direction specified for '%s'; "
+                    "defaulting to higher_is_better=True. Pass "
+                    "metric_directions={'%s': False} if lower is better.",
+                    col,
+                    col,
+                )
+
+        # Build per-item diffs, skipping rows where either score is NaN.
+        items: list[ItemDiff] = []
+        valid_deltas: list[float] = []
+
+        for _, row in merged.iterrows():
+            sa = row[col_a]
+            sb = row[col_b]
+            sa_f = float(sa) if pd.notna(sa) else None
+            sb_f = float(sb) if pd.notna(sb) else None
+
+            if sa_f is not None and sb_f is not None:
+                delta = sb_f - sa_f
+                if hib:
+                    regressed = delta < -tolerance
+                else:
+                    regressed = delta > tolerance
+                valid_deltas.append(delta)
+            else:
+                delta = None
+                regressed = False
+
+            items.append(
+                ItemDiff(
+                    input=str(row["input"]),
+                    score_a=sa_f,
+                    score_b=sb_f,
+                    delta=delta,
+                    regressed=regressed,
+                )
+            )
+
+        deltas_arr = np.array(valid_deltas, dtype=float)
+        n = len(deltas_arr)
+
+        if n >= 2:
+            mean_delta = float(np.mean(deltas_arr))
+            ci_lower, ci_upper = stats_utils.bootstrap_ci(deltas_arr)
+            p_value = stats_utils.paired_permutation_pvalue(deltas_arr)
+        elif n == 1:
+            # A single observation: report the delta but CI and p-value are
+            # not meaningful.
+            mean_delta = float(deltas_arr[0])
+            ci_lower = float("nan")
+            ci_upper = float("nan")
+            p_value = 1.0
+        else:
+            mean_delta = float("nan")
+            ci_lower = float("nan")
+            ci_upper = float("nan")
+            p_value = float("nan")
+
+        n_regressed = sum(1 for it in items if it.regressed)
+
+        metrics_result[col] = MetricDiff(
+            metric_name=col,
+            higher_is_better=hib,
+            mean_delta=mean_delta,
+            ci_lower=ci_lower,
+            ci_upper=ci_upper,
+            p_value=p_value,
+            n_regressed=n_regressed,
+            n_items=len(items),
+            items=items,
+        )
+
+    return RunDiff(
+        run_a_name=run_a.run_name,
+        run_b_name=run_b.run_name,
+        metrics=metrics_result,
+    )

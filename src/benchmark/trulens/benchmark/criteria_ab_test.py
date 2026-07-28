@@ -35,10 +35,12 @@ Example:
     ```
 """
 
+from collections.abc import Callable
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
+from trulens.core.utils import stats as stats_utils
 from trulens.feedback import groundtruth as feedback_groundtruth
 
 log = logging.getLogger(__name__)
@@ -56,7 +58,7 @@ def _to_score(result: Any) -> float:
     return float(result)
 
 
-def _metrics(scores: np.ndarray, expected: np.ndarray) -> Dict[str, float]:
+def _metrics(scores: np.ndarray, expected: np.ndarray) -> dict[str, float]:
     aggregator = feedback_groundtruth.GroundTruthAggregator(
         true_labels=[float(x) for x in expected]
     )
@@ -85,11 +87,11 @@ class CriteriaABTestReport:
     def __init__(
         self,
         name_a: str,
-        scores_a: List[float],
+        scores_a: list[float],
         name_b: str,
-        scores_b: List[float],
-        expected: Optional[List[float]] = None,
-        queries: Optional[List[str]] = None,
+        scores_b: list[float],
+        expected: list[float] | None = None,
+        queries: list[str] | None = None,
     ):
         self.name_a = name_a
         self.name_b = name_b
@@ -101,7 +103,7 @@ class CriteriaABTestReport:
         self.queries = queries
         self.diffs = self.scores_a - self.scores_b
 
-    def metrics(self) -> Dict[str, Dict[str, float]]:
+    def metrics(self) -> dict[str, dict[str, float]]:
         """Per-variant agreement with ground truth. Empty if no expected."""
         if self.expected is None:
             return {}
@@ -110,21 +112,19 @@ class CriteriaABTestReport:
             self.name_b: _metrics(self.scores_b, self.expected),
         }
 
-    def significance(self) -> Dict[str, float]:
+    def significance(self) -> dict[str, float]:
         """Mean score difference (A - B) and its permutation p-value."""
         return {
             "mean_difference": float(np.mean(self.diffs)),
-            "p_value": feedback_groundtruth.paired_permutation_pvalue(
-                self.diffs
-            ),
+            "p_value": stats_utils.paired_permutation_pvalue(self.diffs),
         }
 
-    def top_disagreements(self, k: int = 5) -> List[Dict[str, Any]]:
+    def top_disagreements(self, k: int = 5) -> list[dict[str, Any]]:
         """The ``k`` examples where the two variants differ most."""
         order = np.argsort(-np.abs(self.diffs))[:k]
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for i in order:
-            item: Dict[str, Any] = {
+            item: dict[str, Any] = {
                 "index": int(i),
                 self.name_a: float(self.scores_a[i]),
                 self.name_b: float(self.scores_b[i]),
@@ -135,7 +135,7 @@ class CriteriaABTestReport:
             out.append(item)
         return out
 
-    def winner(self) -> Optional[str]:
+    def winner(self) -> str | None:
         """The variant with lower MAE vs ground truth, or None."""
         metrics = self.metrics()
         if not metrics:
@@ -221,10 +221,10 @@ class CriteriaABTest:
 
     def __init__(
         self,
-        golden_set: List[Dict[str, Any]],
-        variant_a: Dict[str, Any],
-        variant_b: Dict[str, Any],
-        args_fn: Optional[Callable[[Dict[str, Any]], Tuple]] = None,
+        golden_set: list[dict[str, Any]],
+        variant_a: dict[str, Any],
+        variant_b: dict[str, Any],
+        args_fn: Callable[[dict[str, Any]], tuple] | None = None,
     ):
         for variant in (variant_a, variant_b):
             if "fn" not in variant or "name" not in variant:
@@ -235,7 +235,7 @@ class CriteriaABTest:
         self.args_fn = args_fn or self._default_args
 
     @staticmethod
-    def _default_args(row: Dict[str, Any]) -> Tuple:
+    def _default_args(row: dict[str, Any]) -> tuple:
         return (row["query"], row["expected_response"])
 
     def run(self) -> CriteriaABTestReport:
@@ -250,10 +250,10 @@ class CriteriaABTest:
         Raises:
             ValueError: If no row was scored by both variants.
         """
-        scores_a: List[float] = []
-        scores_b: List[float] = []
-        expected: List[Optional[float]] = []
-        queries: List[str] = []
+        scores_a: list[float] = []
+        scores_b: list[float] = []
+        expected: list[float | None] = []
+        queries: list[str] = []
         for row in self.golden_set:
             args = self.args_fn(row)
             try:
